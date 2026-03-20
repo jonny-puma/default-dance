@@ -1,0 +1,14 @@
+debug/
+dance.gif
+.DS_Store
+*.un~
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/

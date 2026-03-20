@@ -13,12 +13,17 @@ Run: .venv/bin/python process.py
 """
 
 from PIL import Image, ImageFilter
+import base64
 import json
 import os
+import stat
+import zlib
 
 GIF_PATH = "dance.gif"
 DEBUG_DIR = "debug"
 OUTPUT_PATH = "ascii_frames.json"
+PLAYER_TEMPLATE = "player.py"
+SCRIPT_OUTPUT = "../default-dance"
 
 BRAILLE_CHAR_W = 60
 FRAME_STEP = 1  # use every frame
@@ -77,16 +82,16 @@ def extract_frames(im, bg_img):
         for j in range(w * h):
             r, g, b = rgb[j]
 
-            # Warmth: how much warmer than blue. Character is warm, bg is blue.
-            warmth = max(0, r - b)
+            # Coolness: how much bluer than red. Background/glow is strongly
+            # blue (B >> R, coolness high). The character ranges from warm
+            # skin (R >> B) to neutral-dark clothing (R ≈ B, coolness ≈ 0).
+            # Only reject pixels that are distinctly blue.
+            coolness = b - r
 
             # Luminance diff from background
             diff = abs(gray[j] - bg[j])
 
-            # Binary mask: if pixel has any warmth at all, it's character.
-            # Even dark clothing (R=30, B=25) gives warmth=5.
-            # The blue bg always has B >> R, so warmth=0.
-            if warmth >= 3 and diff > 3:
+            if coolness < 15 and diff > 3:
                 result.append(min(255, diff))
             else:
                 result.append(0)
@@ -183,6 +188,11 @@ def stretch_contrast(frames, dot_w, dot_h):
     hi = all_vals[int(len(all_vals) * 0.97)]
     print(f"Stretch: lo={lo}, hi={hi} (from {len(all_vals)} pixels)")
 
+    # Map non-zero pixels to [out_lo, 255] so the dimmest character pixels
+    # still land in the first visible density level (not blank).
+    out_lo = 28  # 255/9 ≈ first density bucket boundary
+    out_range = 255 - out_lo
+
     stretched = []
     for frame in frames:
         px = list(frame.getdata())
@@ -191,8 +201,8 @@ def stretch_contrast(frames, dot_w, dot_h):
             if p <= 1:
                 new_px.append(0)
             else:
-                v = int((p - lo) / max(1, hi - lo) * 255)
-                new_px.append(max(0, min(255, v)))
+                v = int((p - lo) / max(1, hi - lo) * out_range + out_lo)
+                new_px.append(max(out_lo, min(255, v)))
         img = Image.new("L", (dot_w, dot_h))
         img.putdata(new_px)
         stretched.append(img)
@@ -234,6 +244,70 @@ def encode_braille(frames, dot_w, dot_h):
     return all_frames
 
 
+# Density ramp: space (empty) → light → heavy. Characters chosen for
+# increasing visual density when rendered in a monospace terminal font.
+DENSITY_RAMP = " .·:;+*#%@"
+
+
+def encode_density(frames, dot_w, dot_h):
+    """Convert grayscale frames to density-mapped character lines.
+
+    Each character cell covers a CELL_W x CELL_H pixel block. The average
+    brightness of that block selects a character from DENSITY_RAMP.
+    """
+    cell_w, cell_h = 2, 4  # same cell size as braille for consistent framing
+    char_w = dot_w // cell_w
+    char_h = dot_h // cell_h
+    n_levels = len(DENSITY_RAMP) - 1  # subtract 1 for the space (background)
+
+    all_frames = []
+    for frame in frames:
+        px = list(frame.getdata())
+        lines = []
+        for char_row in range(char_h):
+            line = ""
+            for char_col in range(char_w):
+                total = 0
+                count = 0
+                for dy in range(cell_h):
+                    for dx in range(cell_w):
+                        x = char_col * cell_w + dx
+                        y = char_row * cell_h + dy
+                        if x < dot_w and y < dot_h:
+                            total += px[y * dot_w + x]
+                            count += 1
+                avg = total / count if count else 0
+                idx = int(avg / 255 * n_levels)
+                idx = min(idx, n_levels)
+                line += DENSITY_RAMP[idx]
+            lines.append(line)
+        all_frames.append(lines)
+
+    print(f"Encoded {len(all_frames)} density frames ({char_w}x{char_h} chars)")
+    return all_frames
+
+
+def generate_script(braille_frames):
+    """Generate the standalone default-dance script from player.py template."""
+    raw = json.dumps(braille_frames).encode()
+    compressed = zlib.compress(raw)
+    encoded = base64.b64encode(compressed).decode()
+
+    # Wrap the base64 string into quoted lines
+    data_lines = []
+    for i in range(0, len(encoded), 76):
+        data_lines.append(f'    "{encoded[i:i+76]}"')
+    data_str = "\n".join(data_lines)
+
+    template = open(PLAYER_TEMPLATE).read()
+    script = template.replace("%%DATA%%", data_str)
+
+    with open(SCRIPT_OUTPUT, "w") as f:
+        f.write(script)
+    os.chmod(SCRIPT_OUTPUT, os.stat(SCRIPT_OUTPUT).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    print(f"Generated {SCRIPT_OUTPUT} ({os.path.getsize(SCRIPT_OUTPUT)} bytes)")
+
+
 def main():
     os.makedirs(DEBUG_DIR, exist_ok=True)
 
@@ -251,13 +325,16 @@ def main():
     print("\n--- Step 4: Stretch contrast ---")
     stretched = stretch_contrast(resized, dot_w, dot_h)
 
-    print("\n--- Step 5: Encode braille ---")
-    braille_frames = encode_braille(stretched, dot_w, dot_h)
+    print("\n--- Step 5: Encode density ---")
+    braille_frames = encode_density(stretched, dot_w, dot_h)
 
     # Save
     with open(OUTPUT_PATH, "w") as f:
         json.dump(braille_frames, f)
     print(f"\nSaved {len(braille_frames)} frames to {OUTPUT_PATH}")
+
+    print("\n--- Step 6: Generate script ---")
+    generate_script(braille_frames)
 
     # Preview
     print("\nPreview frame 17:")
